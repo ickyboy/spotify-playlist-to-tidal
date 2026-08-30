@@ -1,0 +1,35 @@
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "spotify-playlist-to-tidal"
+version = "0.1.0"
+description = "Copy one Spotify playlist to TIDAL."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "platformdirs>=4.4,<5",
+  "spotipy>=2.26,<3",
+  "tidalapi>=0.8.11,<0.9",
+]
+
+[project.scripts]
+spotify-playlist-to-tidal = "spotify_playlist_to_tidal.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.15,<1",
+  "ty>=0.0.75,<1",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]

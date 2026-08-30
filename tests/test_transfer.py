@@ -1,0 +1,121 @@
+# ABOUTME: Tests the pure playlist-transfer rules without contacting either service.
+# ABOUTME: Covers URI parsing, destination naming, matching, and ordered batching.
+
+from datetime import date
+
+import pytest
+
+from spotify_playlist_to_tidal.transfer import (
+    SourceTrack,
+    TrackMetadata,
+    _source_track,
+    batched,
+    choose_playlist_name,
+    metadata_matches,
+    spotify_playlist_id,
+    spotify_playlist_is_public,
+)
+
+PLAYLIST_ID = "37i9dQZF1DXcBWIGoYBM5M"
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (f"spotify:playlist:{PLAYLIST_ID}", PLAYLIST_ID),
+        (f"https://open.spotify.com/playlist/{PLAYLIST_ID}", PLAYLIST_ID),
+        (f"https://open.spotify.com/playlist/{PLAYLIST_ID}?si=abc123", PLAYLIST_ID),
+    ],
+)
+def test_spotify_playlist_id_accepts_playlist_uris(uri: str, expected: str) -> None:
+    assert spotify_playlist_id(uri) == expected
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "spotify:album:37i9dQZF1DXcBWIGoYBM5M",
+        "spotify:playlist:not-an-id",
+        f"https://open.spotify.com.evil.example/playlist/{PLAYLIST_ID}",
+        f"https://open.spotify.com/track/{PLAYLIST_ID}",
+    ],
+)
+def test_spotify_playlist_id_rejects_other_values(uri: str) -> None:
+    with pytest.raises(ValueError, match="Spotify playlist"):
+        spotify_playlist_id(uri)
+
+
+@pytest.mark.parametrize(
+    ("spotify_value", "expected"),
+    [(True, True), (False, False), (None, False), ("true", False), (1, False)],
+)
+def test_spotify_playlist_visibility_defaults_unknown_values_to_private(
+    spotify_value: object, expected: bool
+) -> None:
+    assert spotify_playlist_is_public(spotify_value) is expected
+
+
+def test_choose_playlist_name_keeps_an_unused_name() -> None:
+    assert choose_playlist_name("Road Trip", {"Other"}, date(2026, 3, 7)) == "Road Trip"
+
+
+def test_choose_playlist_name_dates_a_collision() -> None:
+    assert choose_playlist_name("Road Trip", {"Road Trip"}, date(2026, 3, 7)) == "260307 Road Trip"
+
+
+def test_choose_playlist_name_numbers_a_dated_collision() -> None:
+    names = {"Road Trip", "260307 Road Trip", "260307 Road Trip (2)"}
+    assert choose_playlist_name("Road Trip", names, date(2026, 3, 7)) == "260307 Road Trip (3)"
+
+
+def test_source_track_reads_current_spotify_playlist_item_shape() -> None:
+    playlist_item = {
+        "item": {
+            "type": "track",
+            "is_local": False,
+            "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+            "name": "Never Gonna Give You Up",
+            "artists": [{"name": "Rick Astley"}],
+            "duration_ms": 213_573,
+            "explicit": False,
+            "external_ids": {"isrc": "GBARL9300135"},
+        }
+    }
+
+    track = _source_track(playlist_item, position=1)
+
+    assert isinstance(track, SourceTrack)
+    assert track.spotify_uri == "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
+    assert track.isrc == "GBARL9300135"
+
+
+def test_metadata_matches_equivalent_text_and_duration() -> None:
+    spotify = TrackMetadata("Le temps de l'amour", ("Françoise Hardy",), 147.2)
+    tidal = TrackMetadata("Le Temps de l’Amour", ("Francoise Hardy",), 149.0)
+
+    assert metadata_matches(spotify, tidal)
+
+
+def test_metadata_match_rejects_a_different_version() -> None:
+    spotify = TrackMetadata("Midnight City", ("M83",), 244.0)
+    tidal = TrackMetadata("Midnight City (Eric Prydz Private Remix)", ("M83",), 244.0)
+
+    assert not metadata_matches(spotify, tidal)
+
+
+def test_metadata_match_requires_an_artist_and_close_duration() -> None:
+    spotify = TrackMetadata("Home", ("Caribou",), 345.0)
+
+    assert not metadata_matches(spotify, TrackMetadata("Home", ("Four Tet",), 345.0))
+    assert not metadata_matches(spotify, TrackMetadata("Home", ("Caribou",), 350.0))
+
+
+def test_metadata_match_rejects_a_clean_or_explicit_mismatch() -> None:
+    spotify = TrackMetadata("Bad Guy", ("Billie Eilish",), 194.1, explicit=False)
+    tidal = TrackMetadata("Bad Guy", ("Billie Eilish",), 194.0, explicit=True)
+
+    assert not metadata_matches(spotify, tidal)
+
+
+def test_batched_preserves_order_and_duplicates() -> None:
+    assert list(batched(["1", "1", "2", "3"], size=3)) == [("1", "1", "2"), ("3",)]
