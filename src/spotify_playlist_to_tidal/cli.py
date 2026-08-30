@@ -12,7 +12,10 @@ from spotipy.exceptions import SpotifyBaseException
 from tidalapi.exceptions import TidalAPIError
 
 from .auth import (
+    AuthenticationError,
     ConfigurationError,
+    login_spotify,
+    login_tidal,
     spotify_session,
     state_directory,
     tidal_session,
@@ -20,17 +23,40 @@ from .auth import (
 )
 from .transfer import TransferError, TransferResult, copy_playlist, spotify_playlist_id
 
+_COMMAND = "spotify-playlist-to-tidal"
 
-def _parser() -> argparse.ArgumentParser:
+
+def _transfer_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=_COMMAND,
         description="Copy one Spotify playlist to a newly created TIDAL playlist.",
-        epilog="On success, stdout contains only the new TIDAL playlist URI.",
+        epilog=(
+            "On success, stdout contains only the new TIDAL playlist URI. "
+            f"For authentication setup, run: {_COMMAND} auth --help"
+        ),
     )
     parser.add_argument(
         "spotify_uri",
         metavar="SPOTIFY_URI",
         help="spotify:playlist:... URI or https://open.spotify.com/playlist/... URL",
     )
+    return parser
+
+
+def _auth_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{_COMMAND} auth",
+        description="Set up and inspect reusable Spotify and TIDAL authentication.",
+    )
+    commands = parser.add_subparsers(dest="auth_command", required=True)
+    login = commands.add_parser("login", help="authenticate both services")
+    login.add_argument(
+        "--manual",
+        action="store_true",
+        help="print authorization links instead of opening a local browser",
+    )
+    commands.add_parser("status", help="validate cached authentication without login")
+    commands.add_parser("path", help="print the directory containing OAuth tokens")
     return parser
 
 
@@ -51,9 +77,68 @@ def _report_result(result: TransferResult) -> None:
     )
 
 
-def run(arguments: Sequence[str] | None = None) -> int:
-    """Run the command and return a process exit status."""
-    parser = _parser()
+def _authentication_status() -> int:
+    state_path = state_directory()
+    authenticated = True
+
+    try:
+        validate_spotify_configuration()
+        spotify_session(state_path).current_user()
+    except ConfigurationError:
+        spotify_status = "not configured"
+        authenticated = False
+    except AuthenticationError:
+        spotify_status = "not authenticated"
+        authenticated = False
+    except (SpotifyBaseException, OSError) as error:
+        spotify_status = f"error ({error})"
+        authenticated = False
+    else:
+        spotify_status = "authenticated"
+
+    try:
+        tidal_session(state_path)
+    except AuthenticationError:
+        tidal_status = "not authenticated"
+        authenticated = False
+    except (TidalAPIError, OSError) as error:
+        tidal_status = f"error ({error})"
+        authenticated = False
+    else:
+        tidal_status = "authenticated"
+
+    print(f"spotify: {spotify_status}")
+    print(f"tidal: {tidal_status}")
+    return 0 if authenticated else 1
+
+
+def _run_auth(arguments: Sequence[str]) -> int:
+    args = _auth_parser().parse_args(arguments)
+    if args.auth_command == "path":
+        print(state_directory())
+        return 0
+    if args.auth_command == "status":
+        return _authentication_status()
+
+    try:
+        validate_spotify_configuration()
+        state_path = state_directory()
+        login_spotify(state_path, manual=args.manual, report=_report)
+        login_tidal(state_path, manual=args.manual, report=_report)
+    except (
+        AuthenticationError,
+        ConfigurationError,
+        SpotifyBaseException,
+        TidalAPIError,
+        OSError,
+    ) as error:
+        _report(f"error: {error}")
+        return 1
+    return _authentication_status()
+
+
+def _run_transfer(arguments: Sequence[str]) -> int:
+    parser = _transfer_parser()
     args = parser.parse_args(arguments)
     try:
         spotify_playlist_id(args.spotify_uri)
@@ -64,9 +149,10 @@ def run(arguments: Sequence[str] | None = None) -> int:
         validate_spotify_configuration()
         state_path = state_directory()
         spotify = spotify_session(state_path)
-        tidal = tidal_session(state_path, _report)
+        tidal = tidal_session(state_path)
         result = copy_playlist(args.spotify_uri, spotify, tidal, report=_report)
     except (
+        AuthenticationError,
         ConfigurationError,
         TransferError,
         SpotifyBaseException,
@@ -79,6 +165,14 @@ def run(arguments: Sequence[str] | None = None) -> int:
     _report_result(result)
     print(result.tidal_uri, flush=True)
     return 0
+
+
+def run(arguments: Sequence[str] | None = None) -> int:
+    """Dispatch authentication commands or one-URI playlist transfers."""
+    command_arguments = list(arguments) if arguments is not None else sys.argv[1:]
+    if command_arguments[:1] == ["auth"]:
+        return _run_auth(command_arguments[1:])
+    return _run_transfer(command_arguments)
 
 
 def main() -> NoReturn:

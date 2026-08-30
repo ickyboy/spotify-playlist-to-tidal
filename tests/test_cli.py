@@ -2,8 +2,10 @@
 # ABOUTME: Verifies input validation and the machine-readable stdout contract.
 
 import os
+import stat
 import subprocess
 import sys
+from pathlib import Path
 
 
 def test_help_describes_uri_input_and_output() -> None:
@@ -20,6 +22,70 @@ def test_help_describes_uri_input_and_output() -> None:
     assert result.stderr == ""
 
 
+def test_auth_help_lists_setup_commands() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "spotify_playlist_to_tidal", "auth", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    login_help = subprocess.run(
+        [sys.executable, "-m", "spotify_playlist_to_tidal", "auth", "login", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "login" in result.stdout
+    assert "status" in result.stdout
+    assert "path" in result.stdout
+    assert result.stderr == ""
+    assert login_help.returncode == 0
+    assert "--manual" in login_help.stdout
+    assert login_help.stderr == ""
+
+
+def test_auth_path_needs_no_credentials(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "spotify_playlist_to_tidal", "auth", "path"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    state_path = Path(result.stdout.strip())
+    assert result.returncode == 0
+    assert state_path.name == "spotify-playlist-to-tidal"
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o700
+    assert result.stderr == ""
+
+
+def test_auth_status_is_noninteractive_when_setup_is_missing(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["HOME"] = str(tmp_path)
+    for name in ("SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"):
+        environment.pop(name, None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "spotify_playlist_to_tidal", "auth", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == [
+        "spotify: not configured",
+        "tidal: not authenticated",
+    ]
+    assert result.stderr == ""
+
+
 def test_invalid_uri_fails_without_stdout() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "spotify_playlist_to_tidal", "spotify:album:not-a-playlist"],
@@ -31,6 +97,33 @@ def test_invalid_uri_fails_without_stdout() -> None:
     assert result.returncode == 2
     assert result.stdout == ""
     assert "expected a Spotify playlist URI" in result.stderr
+
+
+def test_transfer_does_not_start_interactive_login_when_tokens_are_missing(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment["HOME"] = str(tmp_path)
+    environment["SPOTIPY_CLIENT_ID"] = "configured-client"
+    environment["SPOTIPY_CLIENT_SECRET"] = "configured-secret"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "spotify_playlist_to_tidal",
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "Spotify authentication required" in result.stderr
+    assert "auth login" in result.stderr
 
 
 def test_missing_spotify_credentials_fail_without_stdout() -> None:
