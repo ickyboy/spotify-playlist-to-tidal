@@ -40,6 +40,11 @@ def _transfer_parser() -> argparse.ArgumentParser:
         metavar="SPOTIFY_URI",
         help="spotify:playlist:... URI or https://open.spotify.com/playlist/... URL",
     )
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="publish the new TIDAL playlist publicly (default: private)",
+    )
     return parser
 
 
@@ -150,7 +155,7 @@ def _run_transfer(arguments: Sequence[str]) -> int:
         state_path = state_directory()
         spotify = spotify_session(state_path)
         tidal = tidal_session(state_path)
-        result = copy_playlist(args.spotify_uri, spotify, tidal, report=_report)
+        result = copy_playlist(args.spotify_uri, spotify, tidal, report=_report, public=args.public)
     except (
         AuthenticationError,
         ConfigurationError,

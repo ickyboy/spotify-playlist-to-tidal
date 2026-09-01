@@ -20,8 +20,9 @@ favorites migration, persistent match databases, or unrelated media-management f
 - Human-readable progress, skipped tracks, and errors go to stderr.
 - Transfers are non-interactive. Authentication happens only through explicit `auth` commands.
 - Preserve playlist description, source order, and duplicate tracks.
-- Mirror Spotify public/private visibility. Unknown visibility defaults to private.
-- Publish a public playlist only after all matched tracks have been added successfully.
+- The new TIDAL playlist is private unless `--public` is passed; Spotify visibility is
+  never mirrored.
+- Publish a `--public` playlist only after all matched tracks have been added successfully.
 - A missing catalog match is logged and skipped; it must not abort the transfer or publication.
 - Authentication, network, rate-limit, and playlist-write failures must abort rather than masquerade
   as catalog misses.

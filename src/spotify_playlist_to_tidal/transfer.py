@@ -56,7 +56,6 @@ class SkippedTrack:
 class SourcePlaylist:
     name: str
     description: str
-    public: bool
     item_count: int
     tracks: tuple[SourceTrack, ...]
     skipped: tuple[SkippedTrack, ...]
@@ -90,11 +89,6 @@ def spotify_playlist_id(uri: str) -> str:
         return parts[1]
 
     raise ValueError("expected a Spotify playlist URI or URL")
-
-
-def spotify_playlist_is_public(value: object) -> bool:
-    """Treat only Spotify's explicit public state as public."""
-    return value is True
 
 
 def choose_playlist_name(source_name: str, existing_names: Iterable[str], today: date) -> str:
@@ -189,7 +183,7 @@ def _source_track(item: Mapping[str, Any], position: int) -> SourceTrack | Skipp
 
 def read_spotify_playlist(session: spotipy.Spotify, playlist_id: str) -> SourcePlaylist:
     """Read playlist metadata and every transferable Spotify track in source order."""
-    summary = session.playlist(playlist_id, fields="id,name,description,public")
+    summary = session.playlist(playlist_id, fields="id,name,description")
     name = summary.get("name")
     if not name:
         raise TransferError("Spotify returned a playlist without a name")
@@ -221,7 +215,6 @@ def read_spotify_playlist(session: spotipy.Spotify, playlist_id: str) -> SourceP
     return SourcePlaylist(
         name=name,
         description=summary.get("description") or "",
-        public=spotify_playlist_is_public(summary.get("public")),
         item_count=position,
         tracks=tuple(tracks),
         skipped=tuple(skipped),
@@ -286,8 +279,14 @@ def copy_playlist(
     spotify: spotipy.Spotify,
     tidal: tidalapi.Session,
     report: Callable[[str], None] | None = None,
+    *,
+    public: bool = False,
 ) -> TransferResult:
-    """Copy one Spotify playlist into a newly created TIDAL playlist."""
+    """Copy one Spotify playlist into a newly created TIDAL playlist.
+
+    The new playlist stays private unless ``public`` is set, and is published
+    only after every matched track has been added.
+    """
     notify = report or (lambda _message: None)
     source = read_spotify_playlist(spotify, spotify_playlist_id(spotify_uri))
     notify(f'Matching {len(source.tracks)} track(s) from "{source.name}"...')
@@ -325,11 +324,11 @@ def copy_playlist(
                 f"TIDAL did not add every track; partial playlist: {destination.share_url}"
             )
 
-    _set_tidal_visibility(destination, source.public)
+    _set_tidal_visibility(destination, public)
     return TransferResult(
         tidal_uri=destination.share_url,
         playlist_name=destination_name,
-        public=source.public,
+        public=public,
         source_count=source.item_count,
         copied_count=len(tidal_ids),
         skipped=tuple(sorted(skipped, key=lambda track: track.position)),

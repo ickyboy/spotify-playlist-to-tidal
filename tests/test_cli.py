@@ -19,6 +19,8 @@ def test_help_describes_uri_input_and_output() -> None:
     assert result.returncode == 0
     assert "SPOTIFY_URI" in result.stdout
     assert "TIDAL playlist URI" in result.stdout
+    assert "--public" in result.stdout
+    assert "private" in result.stdout
     assert result.stderr == ""
 
 

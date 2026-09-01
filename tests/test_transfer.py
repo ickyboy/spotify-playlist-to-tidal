@@ -1,6 +1,7 @@
 # ABOUTME: Tests the pure playlist-transfer rules without contacting either service.
 # ABOUTME: Covers URI parsing, destination naming, matching, and ordered batching.
 
+import inspect
 from datetime import date
 
 import pytest
@@ -11,9 +12,9 @@ from spotify_playlist_to_tidal.transfer import (
     _source_track,
     batched,
     choose_playlist_name,
+    copy_playlist,
     metadata_matches,
     spotify_playlist_id,
-    spotify_playlist_is_public,
 )
 
 PLAYLIST_ID = "37i9dQZF1DXcBWIGoYBM5M"
@@ -45,14 +46,11 @@ def test_spotify_playlist_id_rejects_other_values(uri: str) -> None:
         spotify_playlist_id(uri)
 
 
-@pytest.mark.parametrize(
-    ("spotify_value", "expected"),
-    [(True, True), (False, False), (None, False), ("true", False), (1, False)],
-)
-def test_spotify_playlist_visibility_defaults_unknown_values_to_private(
-    spotify_value: object, expected: bool
-) -> None:
-    assert spotify_playlist_is_public(spotify_value) is expected
+def test_copy_playlist_is_private_unless_public_is_requested() -> None:
+    public = inspect.signature(copy_playlist).parameters["public"]
+
+    assert public.default is False
+    assert public.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_choose_playlist_name_keeps_an_unused_name() -> None:
