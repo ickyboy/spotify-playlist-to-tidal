@@ -123,12 +123,39 @@ Spotify share URLs are accepted as well:
 uv run spotify-playlist-to-tidal 'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M'
 ```
 
-The first run opens browser authentication for Spotify and TIDAL. A successful run
-prints only the new TIDAL share URI to stdout:
+Authenticate explicitly with `auth login` before transferring; transfers never open
+browsers or prompt for login. A successful run prints only the new TIDAL share URI to stdout:
 
 ```sh
 tidal_uri=$(uv run spotify-playlist-to-tidal "$spotify_uri")
 ```
+
+### Public-web extraction input
+
+For a public playlist, an agent-assisted browser/web extraction can save the complete
+page Markdown to a local file. Pass that file together with the same Spotify URL or URI;
+the file is parsed locally and is never fetched by this command:
+
+```sh
+uv run spotify-playlist-to-tidal \
+  --web-file ./public-playlist-page.md \
+  'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M'
+```
+
+This path does not need Spotify app configuration or Spotify authentication, but it still
+needs TIDAL authentication for matching and copying. The parser fails closed unless the
+page has one declared track total, contiguous numbered rows, valid Spotify track links,
+complete title/artist/album/duration metadata, and a count matching the declared total.
+A page identity link, when present, must match the supplied Spotify URL/URI. Recommended
+tracks and page footer content are excluded. Web extraction is a snapshot; this command
+does not imply that the saved page is fresh. Matching from web input has no ISRC and uses
+normalized title/artist plus a three-second duration tolerance, so catalog versions can
+be skipped.
+
+Use `--dry-run` with either API or web-file input to perform real TIDAL matching without
+creating or changing a destination playlist. It writes one stable JSON report to stdout,
+including ordered source positions, matched TIDAL IDs, and skips; progress remains on
+stderr. A normal successful transfer still writes exactly one TIDAL playlist URI to stdout.
 
 ## Transfer behavior
 

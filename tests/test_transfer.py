@@ -3,16 +3,22 @@
 
 import inspect
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
+import tidalapi
 
 from spotify_playlist_to_tidal.transfer import (
+    SkippedTrack,
+    SourcePlaylist,
     SourceTrack,
     TrackMetadata,
+    TransferError,
     _source_track,
     batched,
     choose_playlist_name,
     copy_playlist,
+    copy_source_playlist,
     metadata_matches,
     spotify_playlist_id,
 )
@@ -117,3 +123,103 @@ def test_metadata_match_rejects_a_clean_or_explicit_mismatch() -> None:
 
 def test_batched_preserves_order_and_duplicates() -> None:
     assert list(batched(["1", "1", "2", "3"], size=3)) == [("1", "1", "2"), ("3",)]
+
+
+def test_copy_source_playlist_dry_run_reports_ordered_matches_without_creating(monkeypatch) -> None:
+    source_track = SourceTrack(
+        position=1,
+        spotify_uri="spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        isrc=None,
+        metadata=TrackMetadata("Song", ("Artist",), 60),
+    )
+    source = SourcePlaylist("Test", "Description", 1, (source_track,), ())
+    monkeypatch.setattr(
+        "spotify_playlist_to_tidal.transfer._match_tidal_track",
+        lambda session, track: SimpleNamespace(id="tidal-123"),
+    )
+    tidal = object()
+
+    result = copy_source_playlist(source, tidal, dry_run=True)
+
+    assert result.tidal_uri is None
+    assert result.matched == ((1, "tidal-123"),)
+    assert result.copied_count == 1
+
+
+def test_copy_source_playlist_sets_private_before_adding_tracks(monkeypatch) -> None:
+    source_track = SourceTrack(
+        position=1,
+        spotify_uri="spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        isrc=None,
+        metadata=TrackMetadata("Song", ("Artist",), 60),
+    )
+    monkeypatch.setattr(
+        "spotify_playlist_to_tidal.transfer._match_tidal_track",
+        lambda session, track: SimpleNamespace(id="tidal-123"),
+    )
+    events: list[str] = []
+    destination = SimpleNamespace(public=True, num_tracks=0, share_url="tidal:test")
+
+    def make_private() -> bool:
+        events.append("private")
+        destination.public = False
+        return True
+
+    def add_tracks(ids, *, allow_duplicates, limit) -> None:
+        events.append("add")
+        destination.num_tracks += len(ids)
+
+    destination.set_playlist_private = make_private
+    destination.set_playlist_public = lambda: True
+    destination.add = add_tracks
+
+    class FakeUser(tidalapi.LoggedInUser):
+        pass
+
+    user = object.__new__(FakeUser)
+    user.playlists = lambda: ()
+    user.create_playlist = lambda name, description: destination
+
+    copy_source_playlist(
+        SourcePlaylist("Test", "Description", 1, (source_track,), ()), SimpleNamespace(user=user)
+    )
+
+    assert events == ["private", "add"]
+
+
+def test_copy_source_playlist_refuses_to_create_when_nothing_matches(monkeypatch) -> None:
+    source_track = SourceTrack(
+        position=1,
+        spotify_uri="spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        isrc=None,
+        metadata=TrackMetadata("Song", ("Artist",), 60),
+    )
+    monkeypatch.setattr(
+        "spotify_playlist_to_tidal.transfer._match_tidal_track",
+        lambda session, track: None,
+    )
+
+    with pytest.raises(TransferError, match="refusing to create"):
+        copy_source_playlist(SourcePlaylist("Test", "", 1, (source_track,), ()), object())
+
+
+def test_copy_source_playlist_dry_run_reports_all_skips_when_nothing_matches(monkeypatch) -> None:
+    source_track = SourceTrack(
+        position=1,
+        spotify_uri="spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        isrc=None,
+        metadata=TrackMetadata("Song", ("Artist",), 60),
+    )
+    monkeypatch.setattr(
+        "spotify_playlist_to_tidal.transfer._match_tidal_track",
+        lambda session, track: None,
+    )
+
+    result = copy_source_playlist(
+        SourcePlaylist("Test", "", 1, (source_track,), ()), object(), dry_run=True
+    )
+
+    assert result.tidal_uri is None
+    assert result.matched == ()
+    assert result.copied_count == 0
+    assert result.skipped == (SkippedTrack(1, "Artist — Song", "no TIDAL match"),)
