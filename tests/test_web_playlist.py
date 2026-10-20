@@ -174,3 +174,86 @@ def test_read_web_playlist_uses_a_local_file_without_fetching(tmp_path: Path) ->
 
     assert playlist.name == "Test Playlist"
     assert playlist.tracks[0].position == 1
+
+
+@pytest.mark.parametrize("duration", ["3:4", "1:2:03", "3:²", "3:４５", "9" * 400 + ":00"])
+def test_web_duration_rejects_truncation_non_ascii_and_unbounded_values(duration: str) -> None:
+    page = _page(_row(1, TRACK_ID, "Song", "Artist", duration))
+    # The final field may be truncated at EOF, without a recommendations footer.
+    page = page.split("Recommended", 1)[0].rstrip()
+
+    with pytest.raises(TransferError, match="duration"):
+        parse_web_playlist(page, PLAYLIST_URL)
+
+
+@pytest.mark.parametrize(("duration", "seconds"), [("123:45", 7425), ("1:02:03", 3723)])
+def test_web_duration_accepts_complete_minutes_and_hours(duration: str, seconds: int) -> None:
+    playlist = parse_web_playlist(_page(_row(1, TRACK_ID, "Song", "Artist", duration)))
+
+    assert playlist.tracks[0].metadata.duration_seconds == seconds
+
+
+def test_description_preserves_user_links_and_paragraphs_but_not_header_chrome() -> None:
+    page = (
+        _page(_row(1, TRACK_ID, "Song", "Artist", "1:02"))
+        .replace(
+            "A description with an escaped \\| pipe.",
+            "Curated by [Guest](https://open.spotify.com/user/guest). Updated weekly.\n\n"
+            "[Collaborator](https://open.spotify.com/user/collaborator)\n\nLast paragraph.",
+        )
+        .replace("\n1 songs", "\n•1,234 saves•\n\n1 songs")
+    )
+
+    playlist = parse_web_playlist(page, PLAYLIST_URL)
+
+    assert playlist.description == (
+        "Curated by Guest. Updated weekly.\n\nCollaborator\n\nLast paragraph."
+    )
+
+
+@pytest.mark.parametrize(
+    "destination", ["https://example.com/mix_(live)", r"https://example.com/mix_\(live\)"]
+)
+def test_balanced_inline_links_preserve_visible_labels_everywhere(destination: str) -> None:
+    page = _page(_row(1, TRACK_ID, r"Song \[Live\]", r"Artist \[A\]", "1:02"))
+    page = page.replace("# Test Playlist", rf"# [Mix \[Live\]]({destination})")
+    page = page.replace(
+        "A description with an escaped \\| pipe.",
+        rf"Listen to [my \[live\] mix]({destination}) today. Literal \[brackets\].",
+    ).replace("[Album 1]", r"[Album \[One\]]")
+    page = page.replace("[Owner]", r"[Owner \[O\]]")
+
+    playlist = parse_web_playlist(page, PLAYLIST_URL)
+
+    assert playlist.name == "Mix [Live]"
+    assert playlist.description == "Listen to my [live] mix today. Literal [brackets]."
+    assert playlist.tracks[0].metadata.title == "Song [Live]"
+    assert playlist.tracks[0].metadata.artists == ("Artist [A]",)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Listen to [mix](https://example.com/mix_(live)",
+        r"Listen to [mix\](https://example.com/mix)",
+        "Listen to [mix]()",
+    ],
+)
+def test_malformed_inline_links_fail_without_partial_substitution(description: str) -> None:
+    page = _page(_row(1, TRACK_ID, "Song", "Artist", "1:02")).replace(
+        "A description with an escaped \\| pipe.", description
+    )
+
+    with pytest.raises(TransferError, match="Markdown"):
+        parse_web_playlist(page, PLAYLIST_URL)
+
+
+def test_conflicting_page_identities_are_rejected_even_if_first_matches() -> None:
+    page = _page(
+        _row(1, TRACK_ID, "Song", "Artist", "1:02"),
+        playlist_url=("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
+    )
+    page = f"[Skip to main content]({PLAYLIST_URL}#main-view)\n" + page
+
+    with pytest.raises(TransferError, match="playlist identit"):
+        parse_web_playlist(page, PLAYLIST_URL)

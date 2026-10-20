@@ -8,9 +8,9 @@ import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date
-from itertools import islice
+from itertools import combinations, islice
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import spotipy
@@ -60,6 +60,7 @@ class SourcePlaylist:
     item_count: int
     tracks: tuple[SourceTrack, ...]
     skipped: tuple[SkippedTrack, ...]
+    origin: Literal["spotify_api", "spotify_web"] = "spotify_api"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,8 +121,6 @@ def _normalized(value: str) -> str:
 
 def metadata_matches(source: TrackMetadata, candidate: TrackMetadata) -> bool:
     """Conservatively match tracks when an exact ISRC match is unavailable."""
-    source_artists = {_normalized(artist) for artist in source.artists}
-    candidate_artists = {_normalized(artist) for artist in candidate.artists}
     explicit_matches = (
         source.explicit is None
         or candidate.explicit is None
@@ -129,7 +128,9 @@ def metadata_matches(source: TrackMetadata, candidate: TrackMetadata) -> bool:
     )
     return (
         _normalized(source.title) == _normalized(candidate.title)
-        and bool(source_artists & candidate_artists)
+        and bool(source.artists and candidate.artists)
+        and bool(_normalized(source.artists[0]))
+        and _normalized(source.artists[0]) == _normalized(candidate.artists[0])
         and abs(source.duration_seconds - candidate.duration_seconds) <= 3
         and explicit_matches
     )
@@ -184,7 +185,6 @@ def _source_track(item: Mapping[str, Any], position: int) -> SourceTrack | Skipp
     )
 
 
-_WEB_LINK = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 _WEB_MARKDOWN_ESCAPE = re.compile(r"\\([!\\\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 _WEB_TABLE_HEADINGS = frozenset(("#", "Title", "Album", "Date added"))
 
@@ -194,9 +194,73 @@ def _unescape_web_markdown(value: str) -> str:
     return _WEB_MARKDOWN_ESCAPE.sub(r"\1", value)
 
 
+@dataclass(frozen=True, slots=True)
+class _WebLink:
+    start: int
+    end: int
+    label: str
+    destination: str
+
+
+def _closing_web_delimiter(value: str, start: int, opening: str, closing: str) -> int:
+    """Scan balanced delimiters, with bounded nesting and Markdown escapes."""
+    depth = 1
+    index = start + 1
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == opening:
+            depth += 1
+            if depth > 32:
+                raise TransferError("unsupported Markdown link nesting in web playlist")
+        elif character == closing:
+            depth -= 1
+            if not depth:
+                return index
+        index += 1
+    raise TransferError("malformed Markdown link in web playlist")
+
+
+def _web_links(value: str) -> tuple[_WebLink, ...]:
+    """Read inline [label](URL) only; this is not a general Markdown parser."""
+    links: list[_WebLink] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\\":
+            index += 2
+        elif value[index] == "[":
+            label_end = _closing_web_delimiter(value, index, "[", "]")
+            destination_start = label_end + 1
+            if destination_start >= len(value) or value[destination_start] != "(":
+                raise TransferError("unsupported Markdown link in web playlist")
+            end = _closing_web_delimiter(value, destination_start, "(", ")")
+            destination = _unescape_web_markdown(value[destination_start + 1 : end])
+            if not destination or any(character.isspace() for character in destination):
+                raise TransferError("unsupported Markdown link destination in web playlist")
+            links.append(
+                _WebLink(
+                    index,
+                    end + 1,
+                    _unescape_web_markdown(value[index + 1 : label_end]),
+                    destination,
+                )
+            )
+            index = end + 1
+        else:
+            index += 1
+    return tuple(links)
+
+
 def _plain_web_markdown(value: str) -> str:
-    value = _WEB_LINK.sub(lambda match: match.group(1), value)
-    return _unescape_web_markdown(value)
+    pieces: list[str] = []
+    start = 0
+    for link in _web_links(value):
+        pieces.extend((_unescape_web_markdown(value[start : link.start]), link.label))
+        start = link.end
+    pieces.append(_unescape_web_markdown(value[start:]))
+    return "".join(pieces)
 
 
 def _web_resource_id(url: str, resource: str) -> str:
@@ -217,21 +281,26 @@ def _web_resource_id(url: str, resource: str) -> str:
 
 
 def _web_artists(line: str) -> tuple[str, ...]:
-    links = tuple(_WEB_LINK.finditer(line))
-    if not links or _WEB_LINK.sub("", line).strip(" ,"):
+    links = _web_links(line)
+    remainder = line
+    for link in reversed(links):
+        remainder = remainder[: link.start] + remainder[link.end :]
+    if not links or remainder.strip(" ,"):
         raise TransferError("malformed track metadata: artists")
-    artists = tuple(_unescape_web_markdown(match.group(1)) for match in links)
+    artists = tuple(link.label for link in links)
     if not all(artists):
         raise TransferError("malformed track metadata: artists")
-    for match in links:
-        _web_resource_id(match.group(2), "artist")
+    for link in links:
+        _web_resource_id(link.destination, "artist")
     return artists
 
 
 def _web_duration(value: str) -> float:
-    parts = value.split(":")
-    if len(parts) not in (2, 3) or not all(part.isdigit() for part in parts):
+    # Bound conversion before int/float: at most six leading digits, and fixed-width
+    # subfields. This accepts long recordings without unbounded numeric input.
+    if not re.fullmatch(r"[0-9]{1,6}:(?:[0-5][0-9]:)?[0-5][0-9]", value):
         raise TransferError("malformed track metadata: duration")
+    parts = value.split(":")
     if len(parts) == 2:
         minutes, seconds = (int(part) for part in parts)
         hours = 0
@@ -250,21 +319,21 @@ def _web_track(block: list[str], position: int) -> SourceTrack:
     if len(fields) != 6 or not fields[0].startswith("![]("):
         raise TransferError(f"malformed track metadata at position {position}")
 
-    track_links = tuple(_WEB_LINK.finditer(fields[1]))
-    if len(track_links) != 1 or track_links[0].span() != (0, len(fields[1])):
+    track_links = _web_links(fields[1])
+    if len(track_links) != 1 or (track_links[0].start, track_links[0].end) != (0, len(fields[1])):
         raise TransferError(f"malformed track metadata at position {position}")
     title_match = track_links[0]
-    track_id = _web_resource_id(title_match.group(2), "track")
-    title = _unescape_web_markdown(title_match.group(1))
+    track_id = _web_resource_id(title_match.destination, "track")
+    title = title_match.label
     if not title:
         raise TransferError(f"malformed track metadata at position {position}")
     artists = _web_artists(fields[2])
 
-    album_links = tuple(_WEB_LINK.finditer(fields[3]))
-    if len(album_links) != 1 or album_links[0].span() != (0, len(fields[3])):
+    album_links = _web_links(fields[3])
+    if len(album_links) != 1 or (album_links[0].start, album_links[0].end) != (0, len(fields[3])):
         raise TransferError(f"malformed track metadata at position {position}")
-    _web_resource_id(album_links[0].group(2), "album")
-    if not _unescape_web_markdown(album_links[0].group(1)):
+    _web_resource_id(album_links[0].destination, "album")
+    if not album_links[0].label:
         raise TransferError(f"malformed track metadata at position {position}")
 
     return SourceTrack(
@@ -285,19 +354,26 @@ def parse_web_playlist(markdown: str, source_uri: str | None = None) -> SourcePl
         raise TransferError("web playlist is missing an unambiguous track total")
     total = int(totals[0])
 
-    identity = re.search(r"\[Skip to main content\]\(([^)]+)\)", markdown)
-    if identity:
+    page_ids: set[str] = set()
+    for line in lines:
+        if not line.startswith("[Skip to main content]"):
+            continue
+        identity = _web_links(line)
+        if len(identity) != 1 or identity[0].end != len(line):
+            raise TransferError("malformed playlist identity in web page")
         try:
-            page_id = spotify_playlist_id(identity.group(1).split("#", 1)[0])
+            page_ids.add(spotify_playlist_id(identity[0].destination.split("#", 1)[0]))
         except ValueError as error:
             raise TransferError("malformed playlist identity in web page") from error
-        if source_uri is not None:
-            try:
-                source_id = spotify_playlist_id(source_uri)
-            except ValueError as error:
-                raise TransferError("expected a Spotify playlist URI or URL") from error
-            if page_id != source_id:
-                raise TransferError("web page playlist identity does not match source playlist")
+    if len(page_ids) > 1:
+        raise TransferError("conflicting playlist identities in web page")
+    if page_ids and source_uri is not None:
+        try:
+            source_id = spotify_playlist_id(source_uri)
+        except ValueError as error:
+            raise TransferError("expected a Spotify playlist URI or URL") from error
+        if source_id not in page_ids:
+            raise TransferError("web page playlist identity does not match source playlist")
 
     title_index = next(
         (index for index, line in enumerate(lines) if line.startswith("# ") and line[2:].strip()),
@@ -313,18 +389,42 @@ def parse_web_playlist(markdown: str, source_uri: str | None = None) -> SourcePl
     if not name:
         raise TransferError("web playlist is missing playlist title")
 
-    description_lines: list[str] = []
-    for line in lines[title_index + 1 : list_index]:
-        stripped = line.strip()
-        if not stripped or re.search(r"\]\(https://open\.spotify\.com/user/", stripped):
-            continue
-        if re.fullmatch(r"[•\d\s]+saves?[•]", stripped) or re.match(r"^\d+\s+songs?\b", stripped):
-            break
-        description_lines.append(_plain_web_markdown(stripped))
-    description = "\n".join(description_lines)
+    header = lines[title_index + 1 : list_index]
+    total_index = next(
+        (index for index, line in enumerate(header) if re.match(r"^[0-9]+\s+songs?\b", line)),
+        None,
+    )
+    if total_index is None:
+        raise TransferError("web playlist is missing header track total")
+    # The owner is the final standalone user link in the metadata suffix, not
+    # every paragraph containing a user link. Strip only this structural suffix.
+    description_end = total_index
+    owner_seen = False
+    while description_end:
+        line = header[description_end - 1].strip()
+        if not line or re.fullmatch(r"•[0-9][0-9,\s]* saves?•", line):
+            description_end -= 1
+        else:
+            links = _web_links(line)
+            if (
+                owner_seen
+                or len(links) != 1
+                or (links[0].start, links[0].end) != (0, len(line))
+                or not links[0].destination.startswith("https://open.spotify.com/user/")
+            ):
+                break
+            owner_seen = True
+            description_end -= 1
+    description = "\n".join(
+        _plain_web_markdown(line.strip()) for line in header[:description_end]
+    ).strip()
 
     index = list_index + 1
-    while index < len(lines) and not lines[index].strip().isdigit():
+    while (
+        index < len(lines)
+        and not lines[index].strip().isdigit()
+        and not lines[index].startswith("Recommended")
+    ):
         stripped = lines[index].strip()
         if not stripped or stripped in _WEB_TABLE_HEADINGS:
             index += 1
@@ -361,6 +461,7 @@ def parse_web_playlist(markdown: str, source_uri: str | None = None) -> SourcePl
         item_count=total,
         tracks=tuple(tracks),
         skipped=(),
+        origin="spotify_web",
     )
 
 
@@ -427,6 +528,50 @@ def _available(tracks: Iterable[tidalapi.Track]) -> list[tidalapi.Track]:
     return [track for track in tracks if track.available]
 
 
+def _select_compatible_candidate(
+    tracks: list[tidalapi.Track], source: TrackMetadata
+) -> tidalapi.Track | None:
+    """Skip material catalog conflicts; rank only compatible releases deterministically."""
+    tracks = [
+        track
+        for track in tracks
+        if source.explicit is None or track.explicit is None or track.explicit == source.explicit
+    ]
+    if not tracks:
+        return None
+    if len({track.isrc for track in tracks if track.isrc}) > 1:
+        return None
+    if len({track.explicit for track in tracks if track.explicit is not None}) > 1:
+        return None
+    lead_artists = {
+        _normalized(track.artists[0].name)
+        for track in tracks
+        if track.artists and track.artists[0].name
+    }
+    if len(lead_artists) > 1:
+        return None
+    credits = [
+        {_normalized(artist.name) for artist in track.artists or () if artist.name}
+        for track in tracks
+    ]
+    # Missing secondary credits are common across services; different named guests
+    # are not evidence of the same recording, even with a shared lead artist.
+    if any(not (left <= right or right <= left) for left, right in combinations(credits, 2)):
+        return None
+    artist_ids: dict[str, set[str]] = {}
+    for track in tracks:
+        for artist in track.artists or ():
+            artist_id = getattr(artist, "id", None)
+            if artist_id is not None and artist.name:
+                artist_ids.setdefault(_normalized(artist.name), set()).add(str(artist_id))
+    if any(len(ids) > 1 for ids in artist_ids.values()):
+        return None
+    return min(
+        tracks,
+        key=lambda track: (abs(track.duration - source.duration_seconds), str(track.id)),
+    )
+
+
 def _match_tidal_track(session: tidalapi.Session, source: SourceTrack) -> tidalapi.Track | None:
     if source.isrc:
         try:
@@ -434,10 +579,7 @@ def _match_tidal_track(session: tidalapi.Session, source: SourceTrack) -> tidala
         except (InvalidISRC, ObjectNotFound):
             isrc_matches = []
         if isrc_matches:
-            return min(
-                isrc_matches,
-                key=lambda track: abs(track.duration - source.metadata.duration_seconds),
-            )
+            return _select_compatible_candidate(isrc_matches, source.metadata)
 
     query = f"{source.metadata.title} {source.metadata.artists[0]}"
     search_results = session.search(query, models=[tidalapi.Track], limit=20)
@@ -446,12 +588,7 @@ def _match_tidal_track(session: tidalapi.Session, source: SourceTrack) -> tidala
         for track in _available(search_results["tracks"])
         if metadata_matches(source.metadata, _tidal_metadata(track))
     ]
-    if not metadata_matches_:
-        return None
-    return min(
-        metadata_matches_,
-        key=lambda track: abs(track.duration - source.metadata.duration_seconds),
-    )
+    return _select_compatible_candidate(metadata_matches_, source.metadata)
 
 
 def _set_tidal_visibility(playlist: tidalapi.UserPlaylist, public: bool) -> None:
@@ -498,7 +635,9 @@ def copy_source_playlist(
         if index == 1 or index % 10 == 0 or index == total:
             notify(f"Checked {index}/{total} track(s)")
 
-    if not tidal_ids and not dry_run:
+    # Preserve API compatibility for empty/all-miss sources. Saved web snapshots
+    # deliberately refuse zero-match writes; dry runs report JSON for either origin.
+    if source.origin == "spotify_web" and not tidal_ids and not dry_run:
         raise TransferError("no tracks matched TIDAL; refusing to create a playlist")
 
     ordered_skips = tuple(sorted(skipped, key=lambda track: track.position))
